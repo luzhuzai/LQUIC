@@ -31,6 +31,10 @@ type CryptoSetup struct {
 	handshakeComplete bool
 	// 握手数据
 	handshakeData []byte
+	// 会话票据
+	sessionTicket []byte
+	// 0-RTT密钥
+	zeroRTTKey []byte
 }
 
 // NewCryptoSetup 创建新的加密设置
@@ -99,4 +103,55 @@ func (c *CryptoSetup) GetCryptoData(level CryptoLevel) []byte {
 	default:
 		return nil
 	}
+}
+
+// UpdateSessionTicket 更新会话票据
+func (c *CryptoSetup) UpdateSessionTicket(ticket []byte) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if !c.handshakeComplete {
+		return fmt.Errorf("握手未完成，无法更新会话票据")
+	}
+
+	c.sessionTicket = ticket
+	return nil
+}
+
+// CompleteOneRTT 完成1-RTT握手
+func (c *CryptoSetup) CompleteOneRTT() ([]byte, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	// 生成新的会话票据
+	ticket := []byte("new_session_ticket")
+	return ticket, nil
+}
+
+// TryZeroRTT 尝试0-RTT连接
+func (c *CryptoSetup) TryZeroRTT(ticketID []byte) (bool, []byte) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	// 验证会话票据
+	if len(ticketID) == 0 || len(c.sessionTicket) == 0 {
+		return false, nil
+	}
+
+	// 生成0-RTT密钥
+	key := []byte("zero_rtt_key")
+	return true, key
+}
+
+// SetZeroRTTKey 设置0-RTT密钥
+func (c *CryptoSetup) SetZeroRTTKey(key []byte) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if len(key) == 0 {
+		return fmt.Errorf("无效的0-RTT密钥")
+	}
+
+	c.zeroRTTKey = key
+	return nil
 }

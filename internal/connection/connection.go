@@ -50,6 +50,10 @@ type Connection struct {
 	packetNumberGenerator protocol.PacketNumber // 用于生成递增的数据包序号
 	packetNumberMux       sync.Mutex            // 保护包序号生成器的互斥锁
 
+	// 0-RTT相关
+	zeroRTTEnabled bool
+	zeroRTTTicket  []byte
+
 	// 关闭相关
 	closeChan chan struct{}
 	closeOnce sync.Once
@@ -79,8 +83,45 @@ func NewConnection(destConnID, srcConnID protocol.ConnectionID, remoteAddr *net.
 		conn:           conn,
 		cryptoSetup:    cryptoSetup,
 		flowController: flowcontrol.NewFlowController(initialWindowSize, maxWindowSize),
+		zeroRTTEnabled: false,
 		closeChan:      make(chan struct{}),
 	}
+}
+
+// TryZeroRTT 尝试建立0-RTT连接
+func (c *Connection) TryZeroRTT(ticketID []byte) bool {
+	// 尝试使用会话票据进行0-RTT连接
+	success, key := c.cryptoSetup.TryZeroRTT(ticketID)
+	if !success {
+		return false
+	}
+
+	// 使用返回的密钥设置0-RTT加密
+	if err := c.cryptoSetup.SetZeroRTTKey(key); err != nil {
+		return false
+	}
+
+	c.zeroRTTEnabled = true
+	c.zeroRTTTicket = ticketID
+	return true
+}
+
+// CompleteHandshake 完成握手过程
+func (c *Connection) CompleteHandshake() error {
+	// 完成1-RTT握手
+	ticket, err := c.cryptoSetup.CompleteOneRTT()
+	if err != nil {
+		return fmt.Errorf("完成1-RTT握手失败: %v", err)
+	}
+
+	// 更新会话票据用于未来的0-RTT连接
+	if err := c.cryptoSetup.UpdateSessionTicket(ticket); err != nil {
+		return fmt.Errorf("更新会话票据失败: %v", err)
+	}
+
+	// 更新连接状态
+	c.setState(StateEstablished)
+	return nil
 }
 
 // GetState 获取连接状态
