@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // CryptoLevel 表示加密级别
@@ -37,13 +38,20 @@ type CryptoSetup struct {
 	sessionTicket []byte
 	// 0-RTT密钥
 	zeroRTTKey []byte
+	// 0-RTT反重放保护
+	zeroRTTReplayWindow map[string]int64
+	// 0-RTT reject标志
+	zeroRTTRejected bool
+	// 0-RTT回退数据
+	zeroRTTFallbackData []byte
 }
 
 // NewCryptoSetup 创建新的加密设置
 func NewCryptoSetup(tlsConfig *tls.Config) *CryptoSetup {
 	return &CryptoSetup{
-		tlsConfig: tlsConfig,
-		level:     LevelInitial,
+		tlsConfig:           tlsConfig,
+		level:               LevelInitial,
+		zeroRTTReplayWindow: make(map[string]int64),
 	}
 }
 
@@ -161,6 +169,24 @@ func (c *CryptoSetup) TryZeroRTT(ticketID []byte) (bool, []byte) {
 		return false, nil
 	}
 
+	// 检查是否已被拒绝
+	if c.zeroRTTRejected {
+		return false, nil
+	}
+
+	// 反重放保护：检查时间戳和计数器
+	ticketKey := string(ticketID)
+	timestamp := time.Now().Unix()
+	if lastUsed, exists := c.zeroRTTReplayWindow[ticketKey]; exists {
+		// 检查时间窗口（10秒内的重放）
+		if timestamp-lastUsed < 10 {
+			return false, nil
+		}
+	}
+
+	// 更新重放窗口
+	c.zeroRTTReplayWindow[ticketKey] = timestamp
+
 	// 根据QUIC规范生成0-RTT密钥
 	info := append([]byte("tls13 0-rtt "), c.handshakeData...)
 	zeroRTTKey := hkdfExtract(info, ticketID)
@@ -170,8 +196,9 @@ func (c *CryptoSetup) TryZeroRTT(ticketID []byte) (bool, []byte) {
 		return false, nil
 	}
 
-	// 保存0-RTT密钥
+	// 保存0-RTT密钥和回退数据
 	c.zeroRTTKey = zeroRTTKey
+	c.zeroRTTFallbackData = c.handshakeData
 
 	return true, zeroRTTKey
 }
@@ -200,15 +227,8 @@ func (c *CryptoSetup) generateInitialSecrets() []byte {
 		return nil
 	}
 
-	// 从TLS配置中获取连接状态
-	connState := c.tlsConfig.ClientSessionCache
-	if connState == nil {
-		return nil
-	}
-
-	// TODO: 从connection包获取连接ID
-	// 临时使用随机生成的连接ID
-	connID := make([]byte, 20)
+	// 使用8字节长度的连接ID，符合QUIC规范
+	connID := make([]byte, 8)
 	if _, err := c.tlsConfig.Rand.Read(connID); err != nil {
 		return nil
 	}
@@ -234,13 +254,25 @@ func (c *CryptoSetup) generateHandshakeSecrets() []byte {
 	serverRandom := c.handshakeData[32:64]
 	keyMaterial := append(clientRandom, serverRandom...)
 
-	// 使用TLS 1.3的密钥派生函数
+	// 使用TLS 1.3的密钥派生函数生成握手密钥
 	handshakeContext := sha256.Sum256(keyMaterial)
 	handshakeSecret := hkdfExtract(handshakeContext[:], []byte("tls13 hs"))
 
-	// 派生握手流量密钥
-	trafficSecret := hkdfExtract(handshakeSecret, []byte("traffic"))
-	return trafficSecret
+	// 派生客户端握手流量密钥
+	clientLabel := []byte("tls13 quic client hs")
+	clientHandshakeSecret := hkdfExtract(handshakeSecret, clientLabel)
+	clientTrafficSecret := hkdfExtract(clientHandshakeSecret, []byte("key"))
+
+	// 派生服务端握手流量密钥
+	serverLabel := []byte("tls13 quic server hs")
+	serverHandshakeSecret := hkdfExtract(handshakeSecret, serverLabel)
+	serverTrafficSecret := hkdfExtract(serverHandshakeSecret, []byte("key"))
+
+	// 根据当前角色返回相应的密钥
+	if c.tlsConfig.ClientAuth == tls.RequireAndVerifyClientCert {
+		return serverTrafficSecret // 作为服务端
+	}
+	return clientTrafficSecret // 作为客户端
 }
 
 // generateApplicationSecrets 生成应用数据密钥
@@ -254,15 +286,49 @@ func (c *CryptoSetup) generateApplicationSecrets() []byte {
 		return nil
 	}
 
-	// 按照QUIC规范提取主密钥
-	masterSecret := c.handshakeData[len(c.handshakeData)-32:]
+	// 从握手数据中提取TLS主密钥
+	handshakeTrafficSecret := c.handshakeData[:32]
 
-	// 使用TLS 1.3的密钥派生函数
-	appSecret := hkdfExtract(masterSecret, []byte("tls13 ap traffic"))
+	// 使用HKDF-Expand-Label派生应用数据密钥
+	appSecret := hkdfExpandLabel(handshakeTrafficSecret, []byte("tls13 quic app"), nil, 32)
 
-	// 派生应用数据流量密钥
-	trafficSecret := hkdfExtract(appSecret, []byte("quic key"))
+	// 派生QUIC应用数据流量密钥
+	trafficSecret := hkdfExpandLabel(appSecret, []byte("quic traffic"), nil, 32)
 	return trafficSecret
+}
+
+// hkdfExpandLabel 实现HKDF-Expand-Label函数
+func hkdfExpandLabel(secret, label []byte, context []byte, length uint16) []byte {
+	// 构造HKDF标签
+	var hkdfLabel []byte
+	// 添加长度（2字节）
+	hkdfLabel = append(hkdfLabel, byte(length>>8), byte(length))
+	// 添加标签长度（1字节）
+	hkdfLabel = append(hkdfLabel, byte(len(label)))
+	// 添加标签
+	hkdfLabel = append(hkdfLabel, label...)
+	// 添加上下文长度（1字节）
+	hkdfLabel = append(hkdfLabel, byte(len(context)))
+	// 添加上下文（如果有）
+	if context != nil {
+		hkdfLabel = append(hkdfLabel, context...)
+	}
+
+	// 使用HMAC-SHA256作为哈希函数
+	h := hmac.New(sha256.New, secret)
+
+	// 输出密钥材料
+	output := make([]byte, 0, length)
+	counter := byte(1)
+	for len(output) < int(length) {
+		h.Reset()
+		h.Write([]byte{counter})
+		h.Write(hkdfLabel)
+		output = append(output, h.Sum(nil)...)
+		counter++
+	}
+
+	return output[:length]
 }
 
 // hkdfExtract 实现HKDF-Extract函数
